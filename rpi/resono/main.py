@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import math
+import json
 import sqlite3
 import threading
 import tkinter as tk
@@ -10,10 +11,8 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk, ImageDraw
 
-# Torch Pretrained Vision
-import torch
-import torchvision.transforms as transforms
-from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
+# NCNN lightweight inference engine (optimised for ARM / Raspberry Pi)
+import ncnn
 
 # Audio capture & playback
 import sounddevice as sd
@@ -39,13 +38,31 @@ DB_PATH = os.path.join(BASE_DIR, "resono_archive.db")
 
 pygame.mixer.init()
 
-# Santali dictionary suggestions
+# ============================================================
+# NCNN MODEL CONFIGURATION
+# ============================================================
+# Paths to the NCNN FP16 model files exported from training.
+# All files live in the same directory as main.py.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+NCNN_PARAM  = os.path.join(SCRIPT_DIR, "resono_mobilenetv3_large_fp16.ncnn.param")
+NCNN_BIN    = os.path.join(SCRIPT_DIR, "resono_mobilenetv3_large_fp16.ncnn.bin")
+LABELS_FILE = os.path.join(SCRIPT_DIR, "labels.json")
+
+# Input / output blob names (from the PNNX-exported .param file).
+# Verify by opening the .param in a text editor or Netron if inference fails.
+NCNN_INPUT_BLOB  = "in0"
+NCNN_OUTPUT_BLOB = "out0"
+
+# Santali dictionary suggestions  (keys match the training class labels)
 SANTALI_OBJECT_MAP = {
-    "WATER BOTTLE": "Dak' Botol",
-    "WATER CUP / MUG": "Dak' Bati",
-    "MOBILE PHONE": "Phon",
-    "WATCH": "Ghori",
-    "PEN": "Kalam"
+    "WATER_BOTTLE": "Dak' Botol",
+    "MUG":          "Dak' Bati",
+    "PHONE":        "Phon",
+    "WATCH":        "Ghori",
+    "PEN":          "Kalam",
+    "GLASSES":      "Chosma",
+    "SPOON":        "Chamoch"
 }
 
 def init_database():
@@ -81,61 +98,99 @@ def init_database():
 init_database()
 
 # ============================================================
-# PRE-TRAINED MOBILENETV3 CLASSIFIER WITH SMART FILTERING
+# NCNN MOBILENETV3-LARGE FP16 CLASSIFIER
 # ============================================================
 class PretrainedClassifier:
+    """Runs object classification via the NCNN MobileNetV3-Large FP16 model
+    exported from the Resono training pipeline.
+    
+    Requires:
+      model/resono_mobilenetv3_large_fp16.ncnn.param
+      model/resono_mobilenetv3_large_fp16.ncnn.bin
+      model/labels.json   (list like ["glasses","mug",…])
+    """
+
+    # ImageNet normalisation (same values used during training)
+    _MEAN = [123.675, 116.28, 103.53]        # RGB pixel means (0-255 scale)
+    _NORM = [1/58.395, 1/57.12, 1/57.375]    # 1 / std  (0-255 scale)
+    _INPUT_SIZE = 224
+
     def __init__(self):
-        self.classes = ["BACKGROUND", "WATER BOTTLE", "WATER CUP / MUG", "MOBILE PHONE", "WATCH", "PEN"]
-        custom_model_path = "resono_mobilenet_v3.pth"
-        
-        if os.path.exists(custom_model_path):
-            print("[AI] Loading Custom Trained MobileNetV3-Small (RESONO Classes)...")
-            self.model = mobilenet_v3_small(num_classes=len(self.classes))
-            self.model.load_state_dict(torch.load(custom_model_path, map_location="cpu"))
-            self.model.eval()
-            self.is_custom = True
-            self.preprocess = transforms.Compose([
-                transforms.Resize((224, 224)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            ])
-            self.categories = self.classes
+        # --- Load class labels ---------------------------------------------------
+        if os.path.exists(LABELS_FILE):
+            with open(LABELS_FILE, "r") as f:
+                data = json.load(f)
+                if isinstance(data, dict) and "classes" in data:
+                    # Rich metadata format: {"classes": ["glasses", ...], "class_to_idx": {...}, ...}
+                    self.classes = list(data["classes"])
+                elif isinstance(data, dict):
+                    # Flat dict: {"glasses": 0, ...} or {"0": "glasses", ...}
+                    first_val = next(iter(data.values()))
+                    if isinstance(first_val, int):
+                        self.classes = [None] * len(data)
+                        for name, idx in data.items():
+                            self.classes[idx] = name
+                    else:
+                        self.classes = [data[str(i)] for i in range(len(data))]
+                else:
+                    self.classes = list(data)
         else:
-            print("[AI] Loading Pretrained MobileNetV3-Small (ImageNet)...")
-            self.weights = MobileNet_V3_Small_Weights.DEFAULT
-            self.model = mobilenet_v3_small(weights=self.weights).eval()
-            self.is_custom = False
-            self.preprocess = self.weights.transforms()
-            self.categories = self.weights.meta["categories"]
+            # Fallback: hard-coded order from training output
+            print(f"[WARN] {LABELS_FILE} not found — using hard-coded class order.")
+            self.classes = ["glasses", "mug", "pen", "phone", "spoon", "watch", "water_bottle"]
+
+        self.num_classes = len(self.classes)
+        print(f"[AI] Classes ({self.num_classes}): {self.classes}")
+
+        # --- Load NCNN network ---------------------------------------------------
+        if not os.path.exists(NCNN_PARAM) or not os.path.exists(NCNN_BIN):
+            raise FileNotFoundError(
+                f"NCNN model files not found.\n"
+                f"  Expected param : {NCNN_PARAM}\n"
+                f"  Expected bin   : {NCNN_BIN}\n"
+                f"Copy the exported model files into the same folder as main.py."
+            )
+
+        self.net = ncnn.Net()
+        # Use all available CPU cores on the Pi 5
+        self.net.opt.num_threads = 4
+        self.net.load_param(NCNN_PARAM)
+        self.net.load_model(NCNN_BIN)
+        print(f"[AI] NCNN MobileNetV3-Large FP16 loaded from {SCRIPT_DIR}")
+
+    @staticmethod
+    def _softmax(x):
+        """Numerically stable softmax."""
+        e = np.exp(x - np.max(x))
+        return e / e.sum()
 
     def classify_crop(self, crop_cv2):
-        pil_img = Image.fromarray(cv2.cvtColor(crop_cv2, cv2.COLOR_BGR2RGB))
-        batch = self.preprocess(pil_img).unsqueeze(0)
+        """Classify a BGR crop and return (clean_label, confidence, raw_label)."""
+        # Resize to model input size
+        resized = cv2.resize(crop_cv2, (self._INPUT_SIZE, self._INPUT_SIZE))
 
-        with torch.no_grad():
-            prediction = self.model(batch).squeeze(0).softmax(0)
-            top_prob, top_catid = torch.topk(prediction, 1)
+        # Create ncnn Mat from BGR pixel data and resize
+        mat_in = ncnn.Mat.from_pixels(
+            resized, ncnn.Mat.PixelType.PIXEL_BGR2RGB,
+            self._INPUT_SIZE, self._INPUT_SIZE
+        )
 
-        conf = top_prob[0].item()
+        # Apply ImageNet normalisation (mean subtraction + scaling)
+        mat_in.substract_mean_normalize(self._MEAN, self._NORM)
 
-        if self.is_custom:
-            idx = top_catid[0].item()
-            raw_label = self.categories[idx].lower()
-            clean_label = "Background / Idle" if idx == 0 else self.classes[idx]
-        else:
-            raw_label = self.categories[top_catid[0].item()].lower()
-            clean_label = "Background / Idle"
-            
-            if any(w in raw_label for w in ["water bottle", "pop bottle", "beer bottle", "wine bottle"]):
-                clean_label = "WATER BOTTLE"
-            elif any(w in raw_label for w in ["cup", "coffee mug", "mug", "pitcher", "beaker"]):
-                clean_label = "WATER CUP / MUG"
-            elif any(w in raw_label for w in ["cellular telephone", "cellphone", "hand-held computer", "ipod"]):
-                clean_label = "MOBILE PHONE"
-            elif any(w in raw_label for w in ["analog clock", "digital clock", "wall clock", "stopwatch", "watch"]):
-                clean_label = "WATCH"
-            elif any(w in raw_label for w in ["ballpoint", "fountain pen", "pen", "quill"]):
-                clean_label = "PEN"
+        # Run forward pass
+        ex = self.net.create_extractor()
+        ex.input(NCNN_INPUT_BLOB, mat_in)
+        ret, mat_out = ex.extract(NCNN_OUTPUT_BLOB)
+
+        # Convert to numpy and apply softmax
+        logits = np.array(mat_out).flatten()
+        probs = self._softmax(logits)
+
+        idx = int(np.argmax(probs))
+        conf = float(probs[idx])
+        raw_label = self.classes[idx]              # e.g. "water_bottle"
+        clean_label = raw_label.upper()            # e.g. "WATER_BOTTLE"
 
         return clean_label, conf, raw_label
 
@@ -472,15 +527,20 @@ class ResonoApp:
             self.last_clean_class = clean_label
             self.last_confidence = conf
 
-            box_color = (56, 189, 248) if clean_label != "Background / Idle" else (100, 116, 139)
+            # Confidence threshold — treat low-confidence predictions as idle
+            CONF_THRESHOLD = 0.45
+            is_detected = conf >= CONF_THRESHOLD
+
+            box_color = (56, 189, 248) if is_detected else (100, 116, 139)
 
             cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
             cv2.putText(frame, "HOLD OBJECT HERE", (x1 + 18, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 1)
 
-            if clean_label != "Background / Idle":
-                self.pred_lbl.config(text=f"Object: {clean_label}", fg="#10b981")
+            if is_detected:
+                display_name = clean_label.replace("_", " ").title()
+                self.pred_lbl.config(text=f"Object: {display_name}", fg="#10b981")
                 self.conf_lbl.config(text=f"Confidence: {conf*100:.1f}% ({raw_label})", fg="#10b981")
-                self.obj_status_box.config(text=f"Detected: {clean_label} $\\rightarrow$ Ready", fg="#10b981")
+                self.obj_status_box.config(text=f"Detected: {display_name} → Ready", fg="#10b981")
                 self.eyes.state = "detect"
             else:
                 self.pred_lbl.config(text="Object: Background / Idle", fg="#94a3b8")
@@ -498,13 +558,14 @@ class ResonoApp:
 
     def trigger_object_elicitation(self):
         lbl = self.last_clean_class
-        if lbl == "Background / Idle":
-            messagebox.showinfo("RESONO Vision", "Hold a bottle, cup, phone, watch, or pen in the square.")
+        conf = self.last_confidence
+        if conf < 0.45:
+            messagebox.showinfo("RESONO Vision", "Hold an object (bottle, mug, phone, watch, pen, glasses, spoon) in the square.")
             return
 
         self.nb.select(self.tab_o)
         self.o_en.delete(0, tk.END)
-        self.o_en.insert(0, lbl.title())
+        self.o_en.insert(0, lbl.replace("_", " ").title())
 
         self.o_santali.delete(0, tk.END)
         if lbl in SANTALI_OBJECT_MAP:
